@@ -110,7 +110,7 @@ func (g *GameEnv) Reset() {
 	g.Firing = false
 	g.BoltX = 0x10
 	g.BoltFrames = 7
-	g.BoltOffset = 0
+	g.BoltOffset = 15  // near bottom of screen, matching $686B
 	g.BoltGraphic = 0
 	g.BoltHit = false
 
@@ -211,7 +211,7 @@ func (g *GameEnv) stepPlaying(act action.Action) StepResult {
 	// 1. Check input (speed)
 	g.handleSpeedInput(act)
 
-	// 2. Check if bolt hit something (from previous frame)
+	// 2. Handle fire input (only if bolt not already hit something)
 	if !g.BoltHit {
 		g.handleFireInput(act)
 	}
@@ -222,12 +222,12 @@ func (g *GameEnv) stepPlaying(act action.Action) StepResult {
 	// 4. Move trees
 	g.moveTrees()
 
-	// 5. Adjust photon bolt position if firing
+	// 5. Adjust photon bolt horizontal position if firing
 	if g.Firing {
 		g.adjustBoltPosition()
 	}
 
-	// 6. Clear and redraw the playing field
+	// 6. Clear and redraw the playing field (trees + enemies)
 	g.clearScreen()
 	g.renderField()
 
@@ -255,12 +255,13 @@ func (g *GameEnv) stepPlaying(act action.Action) StepResult {
 	// 12. Move bonus enemy
 	g.moveBonusEnemy()
 
-	// 13. Draw photon bolt trail + check hits
+	// 13. Draw photon bolt AFTER trees/enemies so we can detect hits by
+	//     checking existing screen content (pixels + attributes).
 	if !g.BoltHit && g.Firing {
 		g.checkBoltHit()
 	}
 
-	// 14. Draw HUD
+	// 14. Draw player bike and HUD
 	g.drawBike()
 	g.drawHUD()
 
@@ -369,17 +370,28 @@ func (g *GameEnv) handleSteering(act action.Action) {
 	}
 }
 
+// handleFireInput initiates a photon bolt. Matches $68F0:
+// fire only at full speed, nothing exploding, bolt not already in flight.
 func (g *GameEnv) handleFireInput(act action.Action) {
 	if !act.Fire {
 		return
 	}
+	if g.Firing {
+		return // bolt already in flight
+	}
 	if g.Speed != SpeedFast {
-		return // Can only fire at full speed
+		return // can only fire at full speed
 	}
-	if g.BonusFlags&0x80 != 0 {
-		return // Something already being blown up
+	if g.ExplodeFrames > 0 {
+		return // something already exploding
 	}
+	// Initiate bolt — matches $68F0 setup
 	g.Firing = true
+	g.BoltX = 0x10       // centre of screen
+	g.BoltFrames = 7     // 7 frames of travel (6 visible + 1 initial)
+	g.BoltOffset = 15    // start near bottom (ScreenOffsets[15])
+	g.BoltGraphic = 0    // largest bolt graphic
+	g.BoltHit = false
 }
 
 // --- Tree system ---
@@ -1035,48 +1047,117 @@ func (g *GameEnv) moveBikesDistance() {
 
 // --- Photon bolt ---
 
+// adjustBoltPosition shifts the bolt horizontally with the player's steering.
+// Matches $6836: the original does this twice per frame (left/right scan),
+// but once per frame is sufficient for our rendering.
 func (g *GameEnv) adjustBoltPosition() {
-	// Bolt moves with player's steering
 	g.BoltX += g.Handlebar
 }
 
+// checkBoltHit draws the bolt at its current screen position, then checks
+// whether it has hit anything by inspecting existing screen content.
+// Matches the Z80 bolt loop at $6847:
+//   1. Compute screen address from ScreenOffsets[BoltOffset] + BoltX
+//   2. Check existing pixels/attrs for a hit
+//   3. Draw the bolt graphic
+//   4. Colour the trail at the PREVIOUS position
+//   5. Advance: decrement BoltFrames, decrement BoltOffset, increment BoltGraphic
 func (g *GameEnv) checkBoltHit() {
 	if !g.Firing {
 		return
 	}
 
+	// Clamp BoltOffset and BoltGraphic to valid range
+	if g.BoltOffset < 0 || g.BoltOffset >= len(data.ScreenOffsets) {
+		g.resetBolt()
+		return
+	}
+	if g.BoltGraphic < 0 || g.BoltGraphic >= len(data.PhotonBolt) {
+		g.resetBolt()
+		return
+	}
+
+	// Compute bolt screen position from the offset table
+	offEntry := data.ScreenOffsets[g.BoltOffset]
+	screenCol := offEntry[0] + byte(g.BoltX)
+	dispAddr := uint16(offEntry[1])<<8 | uint16(screenCol)
+	attrAddr := uint16(offEntry[2])<<8 | uint16(screenCol)
+
+	// --- Hit detection by reading existing screen content ---
+	// Check if there are already pixels at the bolt position (tree or enemy).
+	existingPixels := g.Buf.Peek(dispAddr)
+
+	if existingPixels != 0 {
+		// Something is there. Check attribute INK colour to identify what.
+		existingAttr := g.Buf.Peek(attrAddr)
+		inkColour := existingAttr & 0x07
+
+		if g.EnemyDistance == DistanceInRange {
+			// $06 = yellow ink = bike 1, $01 = blue ink = bike 2
+			switch inkColour {
+			case 0x06:
+				if g.EnemyActive[0] {
+					g.hitEnemy(0)
+					return
+				}
+			case 0x01:
+				if g.EnemyActive[1] {
+					g.hitEnemy(1)
+					return
+				}
+			}
+		}
+
+		// $07 = white ink = bonus enemy
+		if inkColour == 0x07 {
+			if g.BonusFlags&0x01 != 0 || g.BonusFlags&0x02 != 0 {
+				g.hitBonus()
+				return
+			}
+		}
+
+		// Otherwise: hit a tree or other obstacle — just reset the bolt
+		g.resetBolt()
+		return
+	}
+
+	// --- No hit: draw the bolt graphic ---
+	spriteData := data.PhotonBolt[g.BoltGraphic]
+	addr := dispAddr
+	for i := 0; i < 8 && i < len(spriteData); i++ {
+		g.Buf.DrawByteOR(addr, spriteData[i])
+		addr = screen.NextScanLine(addr)
+	}
+	// Set bolt attribute to white ink on current paper
+	g.Buf.Poke(attrAddr, g.Buf.Peek(attrAddr)|0x07)
+
+	// --- Draw trail at the PREVIOUS position (one step closer to player) ---
+	// The previous position is BoltOffset+1 (one row nearer the bottom).
+	g.drawBoltTrail()
+
+	// --- Advance bolt toward horizon ---
 	g.BoltFrames--
 	if g.BoltFrames <= 0 {
 		g.resetBolt()
 		return
 	}
+	g.BoltOffset--    // move toward horizon (lower index)
+	g.BoltGraphic++   // smaller sprite
+}
 
-	g.BoltOffset++
-	g.BoltGraphic++
-
-	// Check if bolt hit an enemy bike (only if in range)
-	if g.EnemyDistance == DistanceInRange {
-		for e := 0; e < 2; e++ {
-			if !g.EnemyActive[e] {
-				continue
-			}
-			// Simple hit detection: bolt X matches enemy position
-			diff := g.BoltX - g.EnemyPos[e]
-			if diff >= -1 && diff <= 1 {
-				g.hitEnemy(e)
-				return
-			}
-		}
+// drawBoltTrail colours the PREVIOUS bolt position with $23 (green paper,
+// magenta ink) to leave a visible trail. Matches the trail colouring in the
+// original at $6870.
+func (g *GameEnv) drawBoltTrail() {
+	prevOffset := g.BoltOffset + 1
+	if prevOffset >= len(data.ScreenOffsets) {
+		return
 	}
-
-	// Check if bolt hit bonus enemy
-	if g.BonusFlags&0x01 != 0 || g.BonusFlags&0x02 != 0 {
-		diff := g.BoltX - g.BonusX
-		if diff >= -1 && diff <= 1 {
-			g.hitBonus()
-			return
-		}
-	}
+	offEntry := data.ScreenOffsets[prevOffset]
+	screenCol := offEntry[0] + byte(g.BoltX)
+	attrAddr := uint16(offEntry[2])<<8 | uint16(screenCol)
+	// $23 = green paper (4<<3=0x20), magenta ink (3=0x03) = 0x23
+	g.Buf.Poke(attrAddr, 0x23)
 }
 
 func (g *GameEnv) hitEnemy(idx int) {
@@ -1099,12 +1180,14 @@ func (g *GameEnv) hitBonus() {
 	g.resetBolt()
 }
 
+// resetBolt resets all bolt state. Matches $686B exactly:
+// BoltOffset=15 (near bottom), BoltFrames=7, BoltGraphic=0, BoltX=$10.
 func (g *GameEnv) resetBolt() {
 	g.Firing = false
 	g.BoltX = 0x10
 	g.BoltFrames = 7
-	g.BoltOffset = 0
-	g.BoltGraphic = 0
+	g.BoltOffset = 15  // start near bottom of playing area
+	g.BoltGraphic = 0  // largest bolt graphic
 	g.BoltHit = false
 }
 
@@ -1123,30 +1206,35 @@ func (g *GameEnv) processHitBike() {
 
 // --- Sector management ---
 
+// switchSector replicates $62CB: reset enemies, flip day/night, advance sector.
 func (g *GameEnv) switchSector() {
+	// Reset enemy bikes ($62CB-$62D3)
 	g.NumEnemies = 2
 	g.EnemyActive = [2]bool{true, true}
 	g.EnemyPos = [2]int{0, 0x20}
+	g.EnemyDir = [2]int{0, 0}
+	g.EnemyDirFrames = [2]int{3, 3}
+	g.EnemyMoveUnits = [2]int{0, 0}
 	g.EnemyDistance = DistanceFar
 	g.EnemyDistCount = 3
 	g.BonusFlags &^= 0x20 // reset bonus appearance flag
+	g.resetBolt()
 
-	// Toggle day/night
+	// Toggle day/night ($62D5-$62D9: RRCA on DayNightFlag)
 	g.DayNightFlag = (g.DayNightFlag >> 1) | (g.DayNightFlag << 7)
 	g.IsNight = g.DayNightFlag&0x01 != 0
 
-	// Advance sector
-	g.Sector++
-	if g.Sector > MaxSector {
-		g.Sector = 1
-		// Big bonus for completing all 8 sectors
-		for i := 0; i < 15; i++ {
-			g.incrementScore()
-		}
-	}
-
-	// Populate trees for new sector (only on day transitions)
+	// Day transition increments sector ($60C5-$60C8)
 	if !g.IsNight {
+		g.Sector++
+		if g.Sector > MaxSector {
+			g.Sector = 1
+			// Big bonus ($6C17): increment score 15 times
+			for i := 0; i < 15; i++ {
+				g.incrementScore()
+			}
+		}
+		// Populate trees for new sector density ($64B7)
 		g.populateTrees()
 	}
 
