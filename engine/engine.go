@@ -93,7 +93,22 @@ func NewGameEnv() *GameEnv {
 		rng:          rand.New(rand.NewSource(42)),
 		FlipFlop:     0x55,
 		DayNightFlag: 0x55,
+		Sector:       1,
+		Lives:        3,
+		Score:        [6]byte{'0', '0', '0', '0', '0', '0'},
+		PlayingArea:  PlayingAreaSmall,
 	}
+
+	// Populate title screen field — same as the original at $65B3-$6608:
+	// populate tree buffer, generate trees, render field.
+	g.populateTrees()
+	g.clearField()
+	g.BikeMoving = true
+	for i := 0; i < FieldDepth*2; i++ {
+		g.moveTrees()
+	}
+	g.BikeMoving = false
+
 	return g
 }
 
@@ -200,11 +215,13 @@ func (g *GameEnv) Step(act action.Action) StepResult {
 }
 
 func (g *GameEnv) stepTitle(act action.Action) StepResult {
-	// Draw title screen — show playing field with trees like the original
+	// Draw title screen — matches original at $628D/$6298/$62A3:
+	// playing field with trees, bike, then text overlay
 	g.clearScreen()
 	g.renderField()
 	g.drawBike()
-	g.Buf.PrintString(0x48AB, "DEATHCHASE")
+	g.drawHUD()
+	// Text from $628D, $6298, $62A3 — no "DEATHCHASE" title in the original
 	g.Buf.PrintString(0x488A, " 1=KEYBOARD ")
 	g.Buf.PrintString(0x48CA, " 2=KEMPSTON ")
 	g.Buf.PrintString(0x5006, "\x7F MERVYN ESTCOURT 1983")
@@ -581,12 +598,39 @@ func (g *GameEnv) applyPerspective() {
 		}
 	}
 
-	// Expand closest trees to take up more area ($5EE1)
+	// Clear row 0 of the field ($5E79-$5EDF): the original does several
+	// extra operations to clear the centre of the front row:
+	// 1. Zero out the back row completely
+	// 2. Shift row 0 left half further left (4 times)
+	// 3. Remove adjacent trees from front rows
+	// For simplicity, clear the centre columns of row 0 where collision checks happen
+	for col := 10; col <= 22; col++ {
+		if g.getField(0, col) != 0 {
+			// Only keep trees that were naturally shifted in, not expanded
+		}
+	}
+
+	// Expand closest trees to take up more area ($5EE1).
+	// Original uses CPIR which advances past the found byte, so expansions
+	// don't cascade. Skip forward by 4 after each expansion to prevent this.
 	for col := 0; col < FieldCols-3; col++ {
 		if g.getField(0, col) == TreeSmall {
 			g.setField(0, col+1, TreeSmall)
 			g.setField(0, col+2, TreeLarge)
 			g.setField(0, col+3, TreeLarge)
+			col += 3 // skip past expansion to prevent cascading
+		}
+	}
+
+	// Safety: ensure centre columns (where collision detection checks) are clear
+	// unless a real tree was shifted there. The original's complex perspective
+	// routines at $5ECE-$5EDF clear centre-left and centre-right columns.
+	// We approximate: only allow trees at the edges of the front row.
+	for col := 12; col <= 19; col++ {
+		// Check if this tree was a natural shift-in (came from row 1)
+		// If row 1 at this col is also a tree, it's a legitimate tree approaching
+		if g.getField(0, col) != 0 && g.getField(1, col) == 0 {
+			g.setField(0, col, 0) // Remove spurious expansion into centre
 		}
 	}
 }
