@@ -735,6 +735,57 @@ func (g *GameEnv) renderField() {
 	}
 
 	g.drawEnemiesOnField()
+	g.drawBonusEnemy()
+}
+
+// drawBonusEnemy draws a plane or tank if one is active.
+// Drawn at $4860+BonusX (same row as enemy bikes), using plane/tank sprites.
+func (g *GameEnv) drawBonusEnemy() {
+	if g.BonusX < 1 || g.BonusX > 30 {
+		return
+	}
+	if g.BonusFlags&0x01 == 0 && g.BonusFlags&0x02 == 0 {
+		return
+	}
+
+	screenCol := byte(0x60) + byte(g.BonusX)
+	dispAddr := uint16(0x48)<<8 | uint16(screenCol)
+	attrAddr := uint16(0x59)<<8 | uint16(screenCol)
+
+	// Choose sprite: plane or tank, normal or exploded
+	var leftSprite, rightSprite []byte
+	if g.BonusFlags&0x80 != 0 {
+		// Being blown up
+		leftSprite = data.PlaneExplodedLeft
+		rightSprite = data.PlaneExplodedRight
+	} else if g.Sector%2 == 0 {
+		// Even sectors: tank
+		leftSprite = data.TankLeft
+		rightSprite = data.TankRight
+	} else {
+		// Odd sectors: plane
+		leftSprite = data.PlaneLeft
+		rightSprite = data.PlaneRight
+	}
+
+	// Draw left half
+	addr := dispAddr
+	for i := 0; i < 8 && i < len(leftSprite); i++ {
+		g.Buf.DrawByteOR(addr, leftSprite[i])
+		addr = screen.NextScanLine(addr)
+	}
+
+	// Draw right half at next column
+	rightAddr := dispAddr + 1
+	addr = rightAddr
+	for i := 0; i < 8 && i < len(rightSprite); i++ {
+		g.Buf.DrawByteOR(addr, rightSprite[i])
+		addr = screen.NextScanLine(addr)
+	}
+
+	// Set attribute: white ink
+	g.Buf.Poke(attrAddr, g.Buf.Peek(attrAddr)|0x07)
+	g.Buf.Poke(attrAddr+1, g.Buf.Peek(attrAddr+1)|0x07)
 }
 
 // nightAttr converts a day-mode attribute to its night equivalent.
