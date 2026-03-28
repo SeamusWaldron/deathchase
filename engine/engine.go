@@ -911,11 +911,13 @@ func (g *GameEnv) drawEnemyBike(enemyIdx int, dispAddr, attrAddr uint16) {
 	}
 
 	// Set attribute — yellow (6) for bike 1, blue (1) for bike 2
-	// Original at $6193-$619D: OR the colour into existing attribute
+	// Original at $6193-$619D: OR the colour into existing attribute.
+	// We must clear INK bits first (AND $F8) then set the colour,
+	// otherwise tree ink bits combine and produce wrong colour for hit detection.
 	if enemyIdx == 0 {
-		g.Buf.Poke(attrAddr, g.Buf.Peek(attrAddr)|0x06) // yellow ink
+		g.Buf.Poke(attrAddr, (g.Buf.Peek(attrAddr)&0xF8)|0x06) // yellow ink
 	} else {
-		g.Buf.Poke(attrAddr, g.Buf.Peek(attrAddr)|0x01) // blue ink
+		g.Buf.Poke(attrAddr, (g.Buf.Peek(attrAddr)&0xF8)|0x01) // blue ink
 	}
 }
 
