@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"deathchase/audio"
 	"deathchase/engine"
 	"deathchase/input"
 	"deathchase/screen"
@@ -26,6 +27,8 @@ type Game struct {
 	env      *engine.GameEnv
 	renderer *screen.Renderer
 	offImg   *ebiten.Image
+	snd      *audio.Audio
+	wasEngine bool // track engine state for start/stop transitions
 }
 
 func New() *Game {
@@ -33,6 +36,7 @@ func New() *Game {
 		env:      engine.NewGameEnv(),
 		renderer: screen.NewRenderer(),
 		offImg:   ebiten.NewImage(Width, Height),
+		snd:      audio.New(),
 	}
 	return g
 }
@@ -50,7 +54,34 @@ func (g *Game) Update() error {
 		g.takeScreenshot()
 	}
 
-	g.env.Step(act)
+	result := g.env.Step(act)
+
+	// Drive audio from game events
+	if result.EngineOn && !g.wasEngine {
+		g.snd.StartEngine()
+	} else if !result.EngineOn && g.wasEngine {
+		g.snd.StopEngine()
+	}
+	g.wasEngine = result.EngineOn
+
+	if result.Fired {
+		g.snd.Play(audio.SfxBolt)
+	}
+	if result.EnemyHit {
+		g.snd.Play(audio.SfxExplosion)
+	}
+	if result.TreeCrash {
+		g.snd.StopEngine()
+		g.wasEngine = false
+		g.snd.Play(audio.SfxCrash)
+	}
+	if result.GameOver {
+		g.snd.Play(audio.SfxDescending)
+	}
+	if result.SectorChange {
+		g.snd.Play(audio.SfxAscending)
+	}
+
 	return nil
 }
 

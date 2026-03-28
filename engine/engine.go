@@ -76,6 +76,13 @@ type GameEnv struct {
 
 	// Range indicator flash state
 	RangeFlash bool
+
+	// Per-frame audio event flags (reset each Step)
+	evFired        bool
+	evEnemyHit     bool
+	evTreeCrash    bool
+	evSectorChange bool
+	evGameOver     bool
 }
 
 // NewGameEnv creates a new game environment.
@@ -169,6 +176,13 @@ func (g *GameEnv) Reset() {
 func (g *GameEnv) Step(act action.Action) StepResult {
 	g.FrameCount++
 
+	// Reset per-frame event flags
+	g.evFired = false
+	g.evEnemyHit = false
+	g.evTreeCrash = false
+	g.evSectorChange = false
+	g.evGameOver = false
+
 	switch g.State {
 	case StateTitle:
 		return g.stepTitle(act)
@@ -246,6 +260,8 @@ func (g *GameEnv) stepPlaying(act action.Action) StepResult {
 	if g.checkTreeCollision() {
 		g.handleDeath()
 		result.State = g.State
+		result.TreeCrash = g.evTreeCrash
+		result.GameOver = g.evGameOver
 		return result
 	}
 
@@ -265,6 +281,11 @@ func (g *GameEnv) stepPlaying(act action.Action) StepResult {
 	g.drawBike()
 	g.drawHUD()
 
+	result.EngineOn = g.BikeMoving
+	result.Fired = g.evFired
+	result.EnemyHit = g.evEnemyHit
+	result.TreeCrash = g.evTreeCrash
+	result.SectorChange = g.evSectorChange
 	result.Score = g.ScoreValue()
 	result.Lives = g.Lives
 	result.Sector = g.Sector
@@ -392,6 +413,7 @@ func (g *GameEnv) handleFireInput(act action.Action) {
 	g.BoltOffset = 15    // start near bottom (ScreenOffsets[15])
 	g.BoltGraphic = 0    // largest bolt graphic
 	g.BoltHit = false
+	g.evFired = true
 }
 
 // --- Tree system ---
@@ -1006,9 +1028,11 @@ func (g *GameEnv) handleDeath() {
 	// Lose a life
 	g.Lives--
 	g.FrameCount = 0
+	g.evTreeCrash = true
 
 	if g.Lives <= 0 {
 		g.State = StateGameOver
+		g.evGameOver = true
 	} else {
 		g.State = StateDead
 	}
@@ -1167,6 +1191,7 @@ func (g *GameEnv) hitEnemy(idx int) {
 	g.ExplodeFrames = 7
 	g.ExplodePos = g.EnemyPos[idx]
 	g.BoltHit = true
+	g.evEnemyHit = true
 	g.incrementScore()
 	g.incrementScore()
 	g.resetBolt()
@@ -1208,6 +1233,8 @@ func (g *GameEnv) processHitBike() {
 
 // switchSector replicates $62CB: reset enemies, flip day/night, advance sector.
 func (g *GameEnv) switchSector() {
+	g.evSectorChange = true
+
 	// Reset enemy bikes ($62CB-$62D3)
 	g.NumEnemies = 2
 	g.EnemyActive = [2]bool{true, true}
