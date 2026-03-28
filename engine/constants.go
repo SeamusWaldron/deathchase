@@ -52,10 +52,10 @@ const TreeBufferSize = 256
 
 // Playing field dimensions in the working buffer
 // The working buffer at $7CA0-$7F9F represents the playing field
-// It's 32 columns wide, with rows going from horizon (back) to foreground (front)
+// It's 32 columns wide, always 24 rows deep
 const (
-	FieldCols     = 0x20 // 32 columns per row
-	FieldRows     = 0x17 // 23 rows from back to front (approx)
+	FieldCols  = 0x20 // 32 columns per row
+	FieldDepth = 24   // always 24 rows ($7CA0-$7F9F = 768 bytes)
 )
 
 // Tree markers in the field buffer

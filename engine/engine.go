@@ -57,7 +57,7 @@ type GameEnv struct {
 	// Tree field buffer — represents the playing field with trees
 	// Rows go from back (horizon) to front (near player)
 	// Each row is FieldCols (32) bytes wide
-	Field [PlayingAreaLarge + FieldCols]byte
+	Field [FieldDepth * FieldCols]byte
 
 	// Tree source buffer ($5B00, 256 bytes)
 	TreeBuf [TreeBufferSize]byte
@@ -142,9 +142,11 @@ func (g *GameEnv) Reset() {
 	// Set up initial playing field
 	g.clearField()
 
-	// Run initial tree generation (10 iterations like the original at $6601-$6608)
+	// Run initial tree generation to fill the field.
+	// Original runs 10 iterations at $6601-$6608, but with 24-row deep field
+	// we need more to fill it. Run enough to scroll through the full depth.
 	g.BikeMoving = true
-	for i := 0; i < 10; i++ {
+	for i := 0; i < FieldDepth*2; i++ {
 		g.moveTrees()
 	}
 	g.BikeMoving = false
@@ -184,14 +186,18 @@ func (g *GameEnv) Step(act action.Action) StepResult {
 }
 
 func (g *GameEnv) stepTitle(act action.Action) StepResult {
-	// Draw title screen
+	// Draw title screen — show playing field with trees like the original
 	g.clearScreen()
+	g.renderField()
+	g.drawBike()
 	g.Buf.PrintString(0x48AB, "DEATHCHASE")
 	g.Buf.PrintString(0x488A, " 1=KEYBOARD ")
 	g.Buf.PrintString(0x48CA, " 2=KEMPSTON ")
 	g.Buf.PrintString(0x5006, "\x7F MERVYN ESTCOURT 1983")
 
-	if act.Enter {
+	// Original uses 1=keyboard, 2=kempston to start.
+	// We accept Enter, Left (key 1), or Fire (space) to start with keyboard.
+	if act.Enter || act.Left || act.Fire {
 		g.UseKempston = false
 		g.Reset()
 	}
@@ -423,9 +429,28 @@ func (g *GameEnv) clearField() {
 
 // moveTrees scrolls the tree field forward and generates new trees at the horizon.
 // Replicates the routine at $5E00.
+//
+// On the real Z80 at 3.5MHz, the tree rendering loop ($5F89) takes ~100-150K
+// T-states per frame. At full speed, the game runs at roughly 25-35 FPS effective,
+// NOT 50. We keep TPS at 50 for responsive input but throttle scrolling:
+//   Speed 0 (fast):   scroll every 2nd frame  (~25 scrolls/sec)
+//   Speed 1 (medium): scroll every 4th frame  (~12 scrolls/sec)
 func (g *GameEnv) moveTrees() {
 	if !g.BikeMoving {
 		return
+	}
+
+	switch g.Speed {
+	case SpeedFast:
+		if g.FrameCount%2 != 0 {
+			return
+		}
+	case SpeedSlow:
+		if g.FrameCount%4 != 0 {
+			return
+		}
+	default:
+		return // SpeedIdle — not moving
 	}
 
 	// Alternate flip-flop each frame
@@ -441,7 +466,7 @@ func (g *GameEnv) moveTrees() {
 		}
 
 		// Copy a line from the tree source buffer to the back row of the field
-		backRow := g.playingAreaRows() - 1
+		backRow := FieldDepth - 1
 		for col := 0; col < 30; col++ {
 			idx := (srcPos - col) & 0xFF
 			g.setField(backRow, col, g.TreeBuf[idx])
@@ -449,10 +474,31 @@ func (g *GameEnv) moveTrees() {
 	}
 
 	// Shift all rows forward (towards the player) by one row
-	totalRows := g.playingAreaRows()
+	totalRows := FieldDepth
 	for row := 0; row < totalRows-1; row++ {
 		for col := 0; col < FieldCols; col++ {
 			g.setField(row, col, g.getField(row+1, col))
+		}
+	}
+
+	// Apply horizontal shift based on handlebar direction.
+	// In the original at $5EFE/$5F28/$5F47, steering shifts the tree
+	// field left or right to create the turning visual.
+	if g.Handlebar != 0 {
+		for row := 0; row < FieldDepth; row++ {
+			if g.Handlebar > 0 {
+				// Turning right: shift trees left
+				for col := 0; col < FieldCols-1; col++ {
+					g.setField(row, col, g.getField(row, col+1))
+				}
+				g.setField(row, FieldCols-1, 0)
+			} else {
+				// Turning left: shift trees right
+				for col := FieldCols - 1; col > 0; col-- {
+					g.setField(row, col, g.getField(row, col-1))
+				}
+				g.setField(row, 0, 0)
+			}
 		}
 	}
 
@@ -464,7 +510,7 @@ func (g *GameEnv) moveTrees() {
 // In the original, this handles the left shunt ($5E2C), right shunt ($5E53),
 // and closest-row expansion ($5EE1).
 func (g *GameEnv) applyPerspective() {
-	totalRows := g.playingAreaRows()
+	totalRows := FieldDepth
 	if totalRows < 4 {
 		return
 	}
@@ -509,10 +555,6 @@ func (g *GameEnv) applyPerspective() {
 			g.setField(0, col+3, TreeLarge)
 		}
 	}
-}
-
-func (g *GameEnv) playingAreaRows() int {
-	return g.PlayingArea / FieldCols
 }
 
 func (g *GameEnv) getField(row, col int) byte {
@@ -578,101 +620,136 @@ func (g *GameEnv) clearScreen() {
 }
 
 // renderField draws the playing field trees onto the screen buffer.
-// This replicates the Print objects routine at $5F89.
+//
+// Replicates the original routine at $5F89. For each column (1-30), scan
+// the field buffer from front (row 0) to back. Each empty row advances
+// the sprite table index. When a tree is found at depth D, sprite table
+// entry D is used. If NO tree is found, the last entry (beyond-horizon)
+// is used — its blank pixels still paint the sky/ground attributes.
+//
+// The tree sprite data contains attribute bytes that CREATE the sky (cyan
+// paper) and ground (green paper). When trees are drawn at all 30 columns,
+// their attributes paint the entire playing area background.
 func (g *GameEnv) renderField() {
-	numRows := NumScreenRows
-	if numRows > g.playingAreaRows() {
-		numRows = g.playingAreaRows()
+	spriteTable := data.TreeSpriteTable
+	numEntries := len(spriteTable)
+
+	for col := 1; col <= 30; col++ {
+		// Scan front to back, advancing sprite table index for empty rows
+		spriteIdx := 0
+		foundTree := false
+		for row := 0; row < FieldDepth; row++ {
+			cell := g.getField(row, col)
+			if cell >= TreeSmall {
+				foundTree = true
+				break
+			}
+			// Empty row — advance to next sprite table entry
+			spriteIdx++
+			if spriteIdx >= numEntries {
+				spriteIdx = numEntries - 1
+			}
+		}
+
+		// If no tree found, use the last entry (beyond-horizon blank)
+		if !foundTree {
+			spriteIdx = numEntries - 1
+		}
+
+		// Clamp index
+		if spriteIdx >= numEntries {
+			spriteIdx = numEntries - 1
+		}
+
+		graphic := &spriteTable[spriteIdx].Graphic
+
+		// Number of screen rows to draw: 18 normally, 16 for centre columns
+		// (replicates the check at $5FED-$5FF5)
+		treeHeight := 18
+		if col >= 13 && col < 20 {
+			treeHeight = 16
+		}
+		numScreenRows := len(data.ScreenOffsets)
+		if treeHeight > numScreenRows {
+			treeHeight = numScreenRows
+		}
+
+		// Draw each row: write attribute byte then 8 pixel bytes
+		for screenRow := 0; screenRow < treeHeight; screenRow++ {
+			treeRow := &graphic.Rows[screenRow]
+
+			offEntry := data.ScreenOffsets[screenRow]
+			screenCol := offEntry[0] + byte(col)
+
+			// Write attribute byte
+			attrAddr := uint16(offEntry[2])<<8 | uint16(screenCol)
+			attr := treeRow.Attr
+			if g.IsNight {
+				// Night mode: convert day attrs to night equivalents
+				attr = g.nightAttr(attr)
+			}
+			g.Buf.Poke(attrAddr, attr)
+
+			// Write 8 pixel bytes (scan lines within this character row)
+			dispAddr := uint16(offEntry[1])<<8 | uint16(screenCol)
+			addr := dispAddr
+			for line := 0; line < 8; line++ {
+				g.Buf.DrawByteOR(addr, treeRow.Pixels[line])
+				addr = screen.NextScanLine(addr)
+			}
+		}
 	}
 
-	for screenRow := 0; screenRow < numRows; screenRow++ {
-		// Map screen row to field row (front rows first)
-		fieldRow := screenRow
+	g.drawEnemiesOnField()
+}
 
-		if screenRow >= len(data.ScreenOffsets) {
-			break
+// nightAttr converts a day-mode attribute to its night equivalent.
+// Day sky ($2B/$2C/$2A/$28) → black paper with green ink ($04).
+// Day ground ($23/$22/$20) → black paper, black ink ($00).
+func (g *GameEnv) nightAttr(dayAttr byte) byte {
+	paper := (dayAttr >> 3) & 0x07
+	if paper >= 4 { // cyan (5) or green (4) paper = sky/canopy area
+		return 0x04 // black paper, green ink
+	}
+	return 0x00 // black paper, black ink (ground)
+}
+
+// drawEnemiesOnField draws enemy bikes at the correct screen positions.
+func (g *GameEnv) drawEnemiesOnField() {
+	enemyRow := g.enemyScreenRow()
+	if enemyRow >= len(data.ScreenOffsets) {
+		return
+	}
+	offEntry := data.ScreenOffsets[enemyRow]
+
+	for e := 0; e < 2; e++ {
+		if !g.EnemyActive[e] {
+			continue
 		}
-		offEntry := data.ScreenOffsets[screenRow]
-		baseCol := offEntry[0]
-		dispHi := offEntry[1]
-		attrHi := offEntry[2]
-
-		for col := 0; col < 30; col++ {
-			treeVal := g.getField(fieldRow, col+1)
-			if treeVal == 0 {
-				continue
-			}
-
-			// Calculate screen position
-			screenCol := baseCol + byte(col)
-			dispAddr := uint16(dispHi)<<8 | uint16(screenCol)
-			attrAddr := uint16(attrHi)<<8 | uint16(screenCol)
-
-			// Draw tree graphic based on size and screen row
-			if treeVal == TreeLarge {
-				g.drawLargeTree(dispAddr, attrAddr, screenRow)
-			} else {
-				g.drawSmallTree(dispAddr, attrAddr, screenRow)
-			}
-
-			// Draw enemy bikes at this position
-			for e := 0; e < 2; e++ {
-				if g.EnemyActive[e] && g.EnemyPos[e] == col+1 {
-					g.drawEnemyBike(e, dispAddr, attrAddr)
-				}
-			}
+		pos := g.EnemyPos[e]
+		if pos < 1 || pos > 30 {
+			continue
 		}
+		screenCol := offEntry[0] + byte(pos)
+		dispAddr := uint16(offEntry[1])<<8 | uint16(screenCol)
+		attrAddr := uint16(offEntry[2])<<8 | uint16(screenCol)
+		g.drawEnemyBike(e, dispAddr, attrAddr)
 	}
 }
 
-func (g *GameEnv) drawSmallTree(dispAddr, attrAddr uint16, depth int) {
-	// Small tree: 8 scanlines of pixel data
-	// Tree appearance varies by depth — further trees are smaller
-	if depth < 10 {
-		// Far trees — just a vertical line pattern
-		for i := 0; i < 8; i++ {
-			pattern := byte(0x18) // simple trunk
-			if i < 4 {
-				pattern = 0x3C // simple canopy
-			}
-			g.Buf.DrawByteOR(dispAddr, pattern)
-			dispAddr = screen.NextScanLine(dispAddr)
-		}
-	} else {
-		// Near trees — bigger
-		for i := 0; i < 8; i++ {
-			pattern := byte(0x18)
-			if i < 6 {
-				pattern = 0x7E
-			}
-			g.Buf.DrawByteOR(dispAddr, pattern)
-			dispAddr = screen.NextScanLine(dispAddr)
-		}
+// enemyScreenRow returns which screen row enemies should appear on.
+func (g *GameEnv) enemyScreenRow() int {
+	switch g.EnemyDistance {
+	case DistanceFar:
+		return 4
+	case DistanceMedium:
+		return 8
+	case DistanceNear:
+		return 12
+	case DistanceInRange:
+		return 16
 	}
-
-	// Set tree colour attribute
-	if g.IsNight {
-		g.Buf.Poke(attrAddr, g.Buf.Peek(attrAddr)&0xF8|0x04) // green ink
-	} else {
-		g.Buf.Poke(attrAddr, 0x24) // green ink, green paper
-	}
-}
-
-func (g *GameEnv) drawLargeTree(dispAddr, attrAddr uint16, depth int) {
-	// Large tree: fills more space
-	for i := 0; i < 8; i++ {
-		pattern := byte(0x18)
-		if i < 7 {
-			pattern = 0xFF
-		}
-		g.Buf.DrawByteOR(dispAddr, pattern)
-		dispAddr = screen.NextScanLine(dispAddr)
-	}
-	if g.IsNight {
-		g.Buf.Poke(attrAddr, g.Buf.Peek(attrAddr)&0xF8|0x04)
-	} else {
-		g.Buf.Poke(attrAddr, 0x2C) // green ink, green paper, bright
-	}
+	return 4
 }
 
 // drawEnemyBike draws an enemy bike sprite at the correct distance/direction.

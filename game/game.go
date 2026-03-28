@@ -60,6 +60,7 @@ func Run() error {
 	ebiten.SetWindowTitle("Deathchase")
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	ebiten.SetScreenClearedEveryFrame(true)
+	ebiten.SetTPS(50) // ZX Spectrum PAL = 50Hz
 
 	// Set icon (just use a small green square for now)
 	icon := image.NewRGBA(image.Rect(0, 0, 16, 16))
