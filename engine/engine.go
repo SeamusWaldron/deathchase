@@ -1203,23 +1203,31 @@ func (g *GameEnv) checkBoltHit() {
 	attrAddr := uint16(offEntry[2])<<8 | uint16(screenCol)
 
 	// --- Hit detection by reading existing screen content ---
-	// Check if there are already pixels at the bolt position (tree or enemy).
-	existingPixels := g.Buf.Peek(dispAddr)
+	// The original at $6813 checks if there are pixels at the bolt's position.
+	// If pixels exist, it checks the attribute colour to determine what was hit.
+	//
+	// We check multiple scan lines (not just the first) since the enemy sprite
+	// may not start at scan line 0 of the character cell.
+	existingPixels := byte(0)
+	checkAddr := dispAddr
+	for line := 0; line < 8; line++ {
+		existingPixels |= g.Buf.Peek(checkAddr)
+		checkAddr = screen.NextScanLine(checkAddr)
+	}
 
 	if existingPixels != 0 {
-		// Something is there. Check attribute INK colour to identify what.
 		existingAttr := g.Buf.Peek(attrAddr)
 		inkColour := existingAttr & 0x07
 
+		// Check for enemy bike hit (only when in range)
 		if g.EnemyDistance == DistanceInRange {
-			// $06 = yellow ink = bike 1, $01 = blue ink = bike 2
 			switch inkColour {
-			case 0x06:
+			case 0x06: // yellow = bike 1
 				if g.EnemyActive[0] {
 					g.hitEnemy(0)
 					return
 				}
-			case 0x01:
+			case 0x01: // blue = bike 2
 				if g.EnemyActive[1] {
 					g.hitEnemy(1)
 					return
@@ -1227,7 +1235,7 @@ func (g *GameEnv) checkBoltHit() {
 			}
 		}
 
-		// $07 = white ink = bonus enemy
+		// Check for bonus enemy hit (white ink)
 		if inkColour == 0x07 {
 			if g.BonusFlags&0x01 != 0 || g.BonusFlags&0x02 != 0 {
 				g.hitBonus()
@@ -1235,9 +1243,16 @@ func (g *GameEnv) checkBoltHit() {
 			}
 		}
 
-		// Otherwise: hit a tree or other obstacle — just reset the bolt
-		g.resetBolt()
-		return
+		// Tree hit: only count it if we're in the sky/canopy area (upper half
+		// of playing field). In the ground area, tree pixel data is from trunk
+		// graphic but shouldn't block the bolt. The original's tree data has
+		// zero pixels in ground rows ($20 attr with $00 pixel bytes).
+		if g.BoltOffset < 10 {
+			// In sky area — hitting a tree canopy, reset bolt
+			g.resetBolt()
+			return
+		}
+		// In ground area — ignore tree pixels, continue bolt travel
 	}
 
 	// --- No hit: draw the bolt graphic ---
