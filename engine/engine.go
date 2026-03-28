@@ -264,38 +264,38 @@ func (g *GameEnv) stepPlaying(act action.Action) StepResult {
 	g.drawBike()
 	g.drawHUD()
 
-	result.Score = g.scoreValue()
+	result.Score = g.ScoreValue()
 	result.Lives = g.Lives
 	result.Sector = g.Sector
 	return result
 }
 
 func (g *GameEnv) stepDead(act action.Action) StepResult {
-	// Brief pause then check lives
+	// Brief pause then rebuild the field and resume.
+	// Matches original at $6711: clear screen, wipe field, redraw, continue.
 	g.FrameCount++
-	if g.FrameCount > 30 {
-		if g.Lives <= 0 {
-			g.State = StateGameOver
-			g.FrameCount = 0
-		} else {
-			g.State = StatePlaying
-			g.Speed = SpeedIdle
-			g.BikeMoving = false
-			g.Firing = false
-			g.resetBolt()
-			g.clearField()
-			g.BikeMoving = true
-			for i := 0; i < 10; i++ {
-				g.moveTrees()
-			}
-			g.BikeMoving = false
-			g.clearScreen()
-			g.renderField()
-			g.drawBike()
-			g.drawHUD()
+	if g.FrameCount > 50 { // ~1 second pause at 50 TPS
+		g.State = StatePlaying
+		g.Speed = SpeedIdle
+		g.BikeMoving = false
+		g.Firing = false
+		g.Handlebar = HandlebarCentre
+		g.resetBolt()
+
+		// Wipe and rebuild field ($6772 + $5E00 loop)
+		g.clearField()
+		g.BikeMoving = true
+		for i := 0; i < FieldDepth*2; i++ {
+			g.moveTrees()
 		}
+		g.BikeMoving = false
+
+		g.clearScreen()
+		g.renderField()
+		g.drawBike()
+		g.drawHUD()
 	}
-	return StepResult{State: g.State, Lives: g.Lives, Score: g.scoreValue(), Sector: g.Sector}
+	return StepResult{State: g.State, Lives: g.Lives, Score: g.ScoreValue(), Sector: g.Sector}
 }
 
 func (g *GameEnv) stepGameOver(act action.Action) StepResult {
@@ -309,7 +309,7 @@ func (g *GameEnv) stepGameOver(act action.Action) StepResult {
 		g.State = StateTitle
 		g.updateHighScore()
 	}
-	return StepResult{State: g.State, Score: g.scoreValue(), Lives: g.Lives, Sector: g.Sector}
+	return StepResult{State: g.State, Score: g.ScoreValue(), Lives: g.Lives, Sector: g.Sector}
 }
 
 func (g *GameEnv) stepSectorChange(act action.Action) StepResult {
@@ -331,7 +331,7 @@ func (g *GameEnv) stepSectorChange(act action.Action) StepResult {
 		g.Buf.PrintString(0x488A, "DAY   PATROL")
 	}
 
-	return StepResult{State: g.State, Score: g.scoreValue(), Lives: g.Lives, Sector: g.Sector}
+	return StepResult{State: g.State, Score: g.ScoreValue(), Lives: g.Lives, Sector: g.Sector}
 }
 
 // --- Input handling ---
@@ -714,14 +714,11 @@ func (g *GameEnv) nightAttr(dayAttr byte) byte {
 	return 0x00 // black paper, black ink (ground)
 }
 
-// drawEnemiesOnField draws enemy bikes at the correct screen positions.
+// drawEnemiesOnField draws enemy bikes at the correct screen position.
+// From the ASM at $6150: ALL distances use the same base address $4860+C
+// (character row 11, pixel Y=88). Distance only changes sprite size.
+// Attribute address is $5960+C (attribute row 11).
 func (g *GameEnv) drawEnemiesOnField() {
-	enemyRow := g.enemyScreenRow()
-	if enemyRow >= len(data.ScreenOffsets) {
-		return
-	}
-	offEntry := data.ScreenOffsets[enemyRow]
-
 	for e := 0; e < 2; e++ {
 		if !g.EnemyActive[e] {
 			continue
@@ -730,26 +727,15 @@ func (g *GameEnv) drawEnemiesOnField() {
 		if pos < 1 || pos > 30 {
 			continue
 		}
-		screenCol := offEntry[0] + byte(pos)
-		dispAddr := uint16(offEntry[1])<<8 | uint16(screenCol)
-		attrAddr := uint16(offEntry[2])<<8 | uint16(screenCol)
+
+		// Fixed screen position: $4860+pos (display), $5960+pos (attribute)
+		// This is character row 11 (pixel Y=88), matching the original at $6150
+		screenCol := byte(0x60) + byte(pos)
+		dispAddr := uint16(0x48)<<8 | uint16(screenCol)
+		attrAddr := uint16(0x59)<<8 | uint16(screenCol)
+
 		g.drawEnemyBike(e, dispAddr, attrAddr)
 	}
-}
-
-// enemyScreenRow returns which screen row enemies should appear on.
-func (g *GameEnv) enemyScreenRow() int {
-	switch g.EnemyDistance {
-	case DistanceFar:
-		return 4
-	case DistanceMedium:
-		return 8
-	case DistanceNear:
-		return 12
-	case DistanceInRange:
-		return 16
-	}
-	return 4
 }
 
 // drawEnemyBike draws an enemy bike sprite at the correct distance/direction.
@@ -776,17 +762,27 @@ func (g *GameEnv) drawEnemyBike(enemyIdx int, dispAddr, attrAddr uint16) {
 		addr = screen.NextScanLine(addr)
 	}
 
-	// For near/in-range bikes, draw second row
+	// For near/in-range bikes (distance 2,3), draw second character row
+	// Original at $61C2: second row at dispAddr with L += $20
 	if g.EnemyDistance >= DistanceNear && len(spriteData) > 8 {
-		// Move to next character row
-		nextRowAddr := dispAddr + 0x20 // next char row in display
+		lo := byte(dispAddr) + 0x20
+		nextRowAddr := (dispAddr & 0xFF00) | uint16(lo)
 		for i := 8; i < 16 && i < len(spriteData); i++ {
 			g.Buf.DrawByteOR(nextRowAddr, spriteData[i])
 			nextRowAddr = screen.NextScanLine(nextRowAddr)
 		}
+		// Set second row attribute too
+		attrLo := byte(attrAddr) + 0x20
+		attrAddr2 := (attrAddr & 0xFF00) | uint16(attrLo)
+		if enemyIdx == 0 {
+			g.Buf.Poke(attrAddr2, g.Buf.Peek(attrAddr2)&0xF8|0x06)
+		} else {
+			g.Buf.Poke(attrAddr2, g.Buf.Peek(attrAddr2)&0xF8|0x01)
+		}
 	}
 
-	// Set attribute — yellow for bike 1, blue for bike 2
+	// Set attribute — yellow (6) for bike 1, blue (1) for bike 2
+	// Original at $6193-$619D: OR the colour into existing attribute
 	if enemyIdx == 0 {
 		g.Buf.Poke(attrAddr, g.Buf.Peek(attrAddr)|0x06) // yellow ink
 	} else {
@@ -971,12 +967,32 @@ func (g *GameEnv) checkTreeCollision() bool {
 	return false
 }
 
+// handleDeath replicates $6711: place crash trees in front of bike, redraw,
+// lose a life, clear field, and restart or game over.
 func (g *GameEnv) handleDeath() {
-	g.Lives--
+	// Place trees right in front of the player for crash visual ($6711-$6726)
+	crashCol := 14 + g.Handlebar // $8D + handlebar, relative to row
+	for i := 0; i < 3; i++ {
+		g.setField(0, crashCol+i, TreeSmall)
+	}
+	for i := 3; i < 6; i++ {
+		g.setField(0, crashCol+i, TreeLarge)
+	}
+
+	// Redraw the scene with the crash tree visible
+	g.clearScreen()
+	g.renderField()
+	g.drawBike()
+	g.drawHUD()
+
+	// Stop the bike and firing
 	g.Speed = SpeedIdle
 	g.BikeMoving = false
 	g.Firing = false
 	g.resetBolt()
+
+	// Lose a life
+	g.Lives--
 	g.FrameCount = 0
 
 	if g.Lives <= 0 {
@@ -1191,7 +1207,7 @@ func (g *GameEnv) incrementScore() {
 	}
 }
 
-func (g *GameEnv) scoreValue() int {
+func (g *GameEnv) ScoreValue() int {
 	val := 0
 	for _, d := range g.Score {
 		val = val*10 + int(d-'0')

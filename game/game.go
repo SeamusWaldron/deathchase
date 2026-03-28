@@ -1,13 +1,18 @@
 package game
 
 import (
+	"fmt"
 	"image"
+	"image/png"
+	"os"
+	"time"
 
 	"deathchase/engine"
 	"deathchase/input"
 	"deathchase/screen"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
 )
 
 const (
@@ -39,6 +44,12 @@ func (g *Game) Update() error {
 		return ebiten.Termination
 	}
 
+	// Screenshot on * key (Shift+8 or numpad multiply)
+	if inpututil.IsKeyJustPressed(ebiten.KeyKPMultiply) ||
+		(ebiten.IsKeyPressed(ebiten.KeyShift) && inpututil.IsKeyJustPressed(ebiten.Key8)) {
+		g.takeScreenshot()
+	}
+
 	g.env.Step(act)
 	return nil
 }
@@ -53,6 +64,45 @@ func (g *Game) Draw(scr *ebiten.Image) {
 
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return Width * Scale, Height * Scale
+}
+
+// takeScreenshot saves the current screen as a PNG file.
+// Filename encodes game state: state_sector_score_lives_timestamp.png
+func (g *Game) takeScreenshot() {
+	stateName := "unknown"
+	switch g.env.State {
+	case engine.StateTitle:
+		stateName = "title"
+	case engine.StatePlaying:
+		stateName = "playing"
+	case engine.StateDead:
+		stateName = "dead"
+	case engine.StateGameOver:
+		stateName = "gameover"
+	case engine.StateSectorChange:
+		stateName = "sector-change"
+	}
+
+	ts := time.Now().Format("150405") // HHMMSS
+	filename := fmt.Sprintf("screenshot_%s_s%d_score%d_lives%d_%s.png",
+		stateName, g.env.Sector, g.env.ScoreValue(), g.env.Lives, ts)
+
+	// Render to an image.RGBA at native resolution
+	img := image.NewRGBA(image.Rect(0, 0, Width, Height))
+	g.renderer.RenderToImage(g.env.Buf, img)
+
+	f, err := os.Create(filename)
+	if err != nil {
+		fmt.Printf("Screenshot failed: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	if err := png.Encode(f, img); err != nil {
+		fmt.Printf("Screenshot encode failed: %v\n", err)
+		return
+	}
+	fmt.Printf("Screenshot saved: %s\n", filename)
 }
 
 func Run() error {

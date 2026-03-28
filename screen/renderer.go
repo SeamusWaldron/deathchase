@@ -1,6 +1,7 @@
 package screen
 
 import (
+	"image"
 	"image/color"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -91,4 +92,34 @@ func (r *Renderer) Render(buf *Buffer, img *ebiten.Image) {
 	}
 
 	img.WritePixels(r.pixels)
+}
+
+// RenderToImage writes the buffer to a standard image.RGBA (for screenshots).
+func (r *Renderer) RenderToImage(buf *Buffer, img *image.RGBA) {
+	for row := 0; row < Rows; row++ {
+		for col := 0; col < Cols; col++ {
+			attr := buf.Attrs[row*Cols+col]
+			ink := attr & 0x07
+			paper := (attr >> 3) & 0x07
+			bright := (attr >> 6) & 0x01
+
+			inkCol := Palette[ink+bright*8]
+			paperCol := Palette[paper+bright*8]
+
+			for scanLine := 0; scanLine < 8; scanLine++ {
+				py := row*8 + scanLine
+				addr := DisplayAddr(col*8, py)
+				pixelByte := buf.Peek(addr)
+
+				for bit := 0; bit < 8; bit++ {
+					px := col*8 + bit
+					if pixelByte&(0x80>>bit) != 0 {
+						img.SetRGBA(px, py, inkCol)
+					} else {
+						img.SetRGBA(px, py, paperCol)
+					}
+				}
+			}
+		}
+	}
 }
